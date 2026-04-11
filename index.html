@@ -1,0 +1,989 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>考試資料產生器 V3.0</title>
+  
+  <!-- Tailwind CSS -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  
+  <!-- Icons (Lucide) -->
+  <script src="https://unpkg.com/lucide@latest"></script>
+  
+  <!-- Mammoth (解析 DOCX) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.6.0/mammoth.browser.min.js"></script>
+  
+  <!-- Html2Canvas (截圖) -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+
+  <style>
+    /* 確保字體平滑與基礎樣式 */
+    body { font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; }
+    textarea { outline: none; }
+    /* 隱藏捲軸但允許捲動 */
+    .no-scrollbar::-webkit-scrollbar { display: none; }
+    .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-800 antialiased min-h-screen">
+
+  <div id="app"></div>
+
+  <script>
+    // --- API Configuration ---
+    const apiKey = ""; // 執行環境會在此處注入 API Key
+
+    // --- State Management ---
+    const state = {
+      gameState: 'setup', // 'setup', 'generating', 'playing', 'results'
+      documentText: '',
+      config: {
+        tfCount: 5,
+        mcCount: 5,
+        totalScore: 100,
+        tfWeight: 50,
+        mcWeight: 50,
+        difficulty: '中等'
+      },
+      examData: null,
+      userAnswers: {},
+      error: '',
+      
+      // LLM Features State
+      summary: '',
+      isSummarizing: false,
+      studyAdvice: '',
+      isGeneratingAdvice: false,
+      
+      // UI States
+      isDownloadingScore: false,
+      showGasModal: false,
+      formTitle: '隨堂單元'
+    };
+
+    // --- Utility: Escape HTML for inline handlers ---
+    const escapeHTML = (str) => {
+      if(typeof str !== 'string') return '';
+      return str.replace(/[&<>'"]/g, 
+        tag => ({
+            '&': '&amp;',
+            '<': '&lt;',
+            '>': '&gt;',
+            "'": '&#39;',
+            '"': '&quot;'
+        }[tag] || tag)
+      );
+    };
+
+    // --- Handlers ---
+    window.handleDocumentTextChange = (value) => {
+      state.documentText = value;
+    };
+
+    window.handleConfigChange = (name, value) => {
+      let newValue = value;
+      
+      if (name === 'tfCount' || name === 'mcCount') {
+        newValue = Math.max(0, Math.min(10, parseInt(value) || 0));
+      } else if (name === 'totalScore') {
+        newValue = Math.max(10, parseInt(value) || 100);
+      } else if (name === 'tfWeight') {
+        newValue = Math.max(0, Math.min(100, parseInt(value) || 0));
+        state.config.tfWeight = newValue;
+        state.config.mcWeight = 100 - newValue;
+      } else if (name === 'mcWeight') {
+        newValue = Math.max(0, Math.min(100, parseInt(value) || 0));
+        state.config.mcWeight = newValue;
+        state.config.tfWeight = 100 - newValue;
+      }
+
+      if (name !== 'tfWeight' && name !== 'mcWeight') {
+        state.config[name] = newValue;
+      }
+      render();
+    };
+
+    window.handleFileUpload = (e) => {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      const fileName = file.name.toLowerCase();
+
+      if (fileName.endsWith('.docx')) {
+        if (!window.mammoth) {
+          alert('Word 解析模組尚未載入完成，請稍候再試。');
+          return;
+        }
+        const reader = new FileReader();
+        reader.onload = async (event) => {
+          try {
+            const arrayBuffer = event.target.result;
+            const result = await window.mammoth.extractRawText({ arrayBuffer });
+            if (result.value.trim()) {
+              state.documentText = result.value;
+              render();
+            } else {
+              alert('無法從此 Word 檔案中提取文字，請確認檔案內容，或直接複製貼上。');
+            }
+          } catch (err) {
+            console.error('DOCX 解析失敗:', err);
+            alert('解析 Word 檔案發生錯誤，建議直接打開檔案將內容複製並貼上。');
+          }
+        };
+        reader.readAsArrayBuffer(file);
+        return;
+      }
+
+      if (fileName.endsWith('.pdf') || fileName.endsWith('.doc')) {
+        alert('提示：目前純網頁環境較難完美解析 PDF 或舊版 .doc 檔案。建議直接將該檔案內容複製，並貼上到下方的文字框中。');
+        return;
+      }
+
+      if (!fileName.match(/\.(txt|md|json|csv)$/i)) {
+         alert('提示：為了獲得最準確的解析結果，強烈建議直接將內容複製並貼上到下方文字框中。目前系統對純文字格式 (.txt, .md 等) 與 Word (.docx) 的直接讀取支援度最佳。');
+      }
+
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        state.documentText = event.target.result;
+        render();
+      };
+      reader.onerror = () => {
+        alert('檔案讀取失敗，請嘗試直接貼上文字。');
+      };
+      reader.readAsText(file);
+    };
+
+    window.generateSummary = async () => {
+      if (!state.documentText.trim()) {
+        state.error = '請先輸入或上傳參考資料內容才能產生摘要！';
+        render();
+        return;
+      }
+      state.isSummarizing = true;
+      state.error = '';
+      render();
+      
+      try {
+        const prompt = `請以繁體中文，針對以下文本提供3到5點的核心重點摘要，幫助學生在考試前快速掌握關鍵。請勿過度冗長。\n\n文本：\n${state.documentText}`;
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+        });
+        if (!response.ok) throw new Error('API 呼叫失敗');
+        const data = await response.json();
+        const textResult = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        state.summary = textResult || '無法產生摘要。';
+      } catch (err) {
+        console.error(err);
+        state.error = '摘要產生失敗：' + err.message;
+      } finally {
+        state.isSummarizing = false;
+        render();
+      }
+    };
+
+    window.generateExam = async () => {
+      if (!state.documentText.trim()) {
+        state.error = '請輸入或上傳參考資料內容！';
+        render();
+        return;
+      }
+      if (state.config.tfCount === 0 && state.config.mcCount === 0) {
+        state.error = '題目數量總和不能為零！';
+        render();
+        return;
+      }
+
+      state.gameState = 'generating';
+      state.error = '';
+      render();
+
+      const prompt = `
+      你是一個專業的考試題目產生器。請根據以下提供的「文本內容」產生測驗題目。
+
+      【考卷設定】
+      - 難易度：${state.config.difficulty} (說明：容易以理解記憶為主；中等以概念辨析為主；困難以跨段整合與迷思辨識為主)
+      - 是非題數量：產生 ${state.config.tfCount} 題
+      - 選擇題數量：產生 ${state.config.mcCount} 題
+
+      【命題嚴格限制】
+      1. 題目必須涵蓋來源的主要內容/重點概念，絕不可重複相同概念換句話說。
+      2. 是非題：每題 2 個選項（是/否），且只有 1 個正確答案。
+      3. 選擇題：每題 4 個選項，且只有 1 個正確答案。
+      4. 干擾選項(Distractors)要合理：必須像是容易選錯的迷思或常見誤解，不得與正解同義或過於荒謬。
+      5. 文字必須清楚、避免模稜兩可；絕對不可出「以上皆是」或「以上皆非」的選項。
+      6. 若來源內容包含圖表數據或例題，請盡量出至少 2 題以圖解讀為核心的題目（若完全沒有則略過）。
+      7. 品質檢查：確保每題只有一個正解、符合難易度、沒有超出文本範圍。
+
+      【輸出格式】
+      必須嚴格回傳 JSON 格式，且「不要」包含任何 Markdown 語法標籤 (如 \`\`\`json 等)，只要純 JSON 字串。
+      格式必須完全一致如下：
+      {
+        "trueFalse": [
+          {
+            "id": "tf_1",
+            "type": "tf",
+            "question": "題目內容...",
+            "options": ["是", "否"],
+            "answer": "是",
+            "explanation": "詳細解答說明..."
+          }
+        ],
+        "multipleChoice": [
+          {
+            "id": "mc_1",
+            "type": "mc",
+            "question": "題目內容...",
+            "options": ["選項A的完整文字", "選項B的完整文字", "選項C的完整文字", "選項D的完整文字"],
+            "answer": "選項A的完整文字", 
+            "explanation": "詳細解答說明..."
+          }
+        ]
+      }
+
+      【文本內容】
+      ${state.documentText}
+      `;
+
+      try {
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            contents: [{ parts: [{ text: prompt }] }],
+            generationConfig: { responseMimeType: "application/json" }
+          })
+        });
+
+        if (!response.ok) throw new Error('API 呼叫失敗，請稍後再試。');
+        
+        const data = await response.json();
+        const textResult = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        if (!textResult) throw new Error('未取得回傳內容');
+
+        let parsedData;
+        try { parsedData = JSON.parse(textResult); } 
+        catch (err) { throw new Error('AI 回傳的格式解析失敗。'); }
+
+        state.examData = {
+          trueFalse: parsedData.trueFalse || [],
+          multipleChoice: parsedData.multipleChoice || [],
+        };
+        state.userAnswers = {};
+        state.gameState = 'playing';
+
+      } catch (err) {
+        console.error(err);
+        state.error = err.message || '產生考卷時發生錯誤';
+        state.gameState = 'setup';
+      } finally {
+        render();
+      }
+    };
+
+    window.handleAnswerSelect = (questionId, optIndexStr) => {
+      if (state.userAnswers[questionId]) return;
+      
+      // Find the question to determine correctness
+      let targetQ = state.examData.trueFalse.find(q => q.id === questionId) || 
+                    state.examData.multipleChoice.find(q => q.id === questionId);
+      
+      if(!targetQ) return;
+      
+      const optIndex = parseInt(optIndexStr);
+      const selectedOption = targetQ.options[optIndex];
+      const isCorrect = selectedOption === targetQ.answer;
+
+      state.userAnswers[questionId] = { selectedOption, isCorrect };
+      render();
+    };
+
+    window.isExamFinished = () => {
+      if (!state.examData) return false;
+      const totalQuestions = state.examData.trueFalse.length + state.examData.multipleChoice.length;
+      return Object.keys(state.userAnswers).length === totalQuestions;
+    };
+
+    window.handleFinishExam = () => {
+      if (!window.isExamFinished()) {
+        if (!window.confirm("您還有題目未作答，確定要結束並評分嗎？未作答將以零分計算。")) return;
+      }
+      state.gameState = 'results';
+      render();
+    };
+
+    const calculateScores = () => {
+      if (!state.examData) return { total: 0, tfScore: 0, mcScore: 0, accuracy: 0, tfCorrect:0, mcCorrect:0, tfTotalQuestions:0, mcTotalQuestions:0 };
+
+      const tfTotalQuestions = state.examData.trueFalse.length;
+      const mcTotalQuestions = state.examData.multipleChoice.length;
+      
+      let tfCorrect = 0, mcCorrect = 0;
+      state.examData.trueFalse.forEach(q => { if (state.userAnswers[q.id]?.isCorrect) tfCorrect++; });
+      state.examData.multipleChoice.forEach(q => { if (state.userAnswers[q.id]?.isCorrect) mcCorrect++; });
+
+      const tfMaxPoints = state.config.totalScore * (state.config.tfWeight / 100);
+      const mcMaxPoints = state.config.totalScore * (state.config.mcWeight / 100);
+
+      const tfScore = tfTotalQuestions > 0 ? (tfCorrect / tfTotalQuestions) * tfMaxPoints : 0;
+      const mcScore = mcTotalQuestions > 0 ? (mcCorrect / mcTotalQuestions) * mcMaxPoints : 0;
+
+      const totalScore = Math.round(tfScore + mcScore);
+      const totalAnsweredCorrectly = tfCorrect + mcCorrect;
+      const totalQuestions = tfTotalQuestions + mcTotalQuestions;
+      const accuracy = totalQuestions > 0 ? Math.round((totalAnsweredCorrectly / totalQuestions) * 100) : 0;
+
+      return { 
+        total: totalScore, 
+        tfScore: Math.round(tfScore), 
+        mcScore: Math.round(mcScore), 
+        accuracy, tfCorrect, mcCorrect, tfTotalQuestions, mcTotalQuestions
+      };
+    };
+
+    window.downloadScoreScreen = () => {
+      if (state.isDownloadingScore) return;
+      
+      state.isDownloadingScore = true;
+      render();
+
+      setTimeout(async () => {
+        const resultNode = document.getElementById('result-screen-content');
+        const buttonsNode = document.getElementById('result-action-buttons');
+
+        if (resultNode && window.html2canvas) {
+          try {
+            if (buttonsNode) buttonsNode.style.display = 'none';
+            
+            const canvas = await window.html2canvas(resultNode, {
+              scale: 1.5,
+              backgroundColor: '#ffffff',
+              logging: false,
+              useCORS: true
+            });
+            
+            if (buttonsNode) buttonsNode.style.display = 'flex';
+
+            const image = canvas.toDataURL("image/png");
+            const link = document.createElement('a');
+            link.href = image;
+            link.download = '測驗成績單.png';
+            link.click();
+          } catch (error) {
+            console.error('截圖失敗:', error);
+            alert('截圖發生錯誤，請稍後再試。');
+            if (buttonsNode) buttonsNode.style.display = 'flex';
+          } finally {
+            state.isDownloadingScore = false;
+            render();
+          }
+        } else {
+          alert('畫面擷取模組載入中，請稍候片刻再點擊。');
+          state.isDownloadingScore = false;
+          render();
+        }
+      }, 100);
+    };
+
+    window.resetApp = () => {
+      state.gameState = 'setup';
+      state.examData = null;
+      state.userAnswers = {};
+      state.summary = '';
+      state.studyAdvice = '';
+      state.showGasModal = false;
+      render();
+    };
+
+    window.toggleGasModal = (show) => {
+      state.showGasModal = show;
+      render();
+    };
+
+    window.handleFormTitleChange = (val) => {
+      state.formTitle = val;
+      // Re-render only the textarea instead of whole app to preserve focus
+      const ta = document.getElementById('gas-textarea');
+      if(ta) ta.value = getGasScriptCode();
+    };
+
+    window.generateStudyAdvice = async () => {
+      if (!state.examData) return;
+      state.isGeneratingAdvice = true;
+      render();
+
+      const wrongQuestions = [];
+      state.examData.trueFalse.forEach(q => {
+        if (state.userAnswers[q.id] && !state.userAnswers[q.id].isCorrect) {
+           wrongQuestions.push(`題目：${q.question} \n學生錯答：${state.userAnswers[q.id].selectedOption} \n正解：${q.answer} \n解析：${q.explanation}`);
+        }
+      });
+      state.examData.multipleChoice.forEach(q => {
+        if (state.userAnswers[q.id] && !state.userAnswers[q.id].isCorrect) {
+           wrongQuestions.push(`題目：${q.question} \n學生錯答：${state.userAnswers[q.id].selectedOption} \n正解：${q.answer} \n解析：${q.explanation}`);
+        }
+      });
+
+      let prompt = "";
+      if (wrongQuestions.length === 0) {
+         prompt = `學生在測驗中獲得了滿分！請用繁體中文給予他一段大約 100 字的熱烈讚美與未來的學習鼓勵。`;
+      } else {
+         prompt = `學生在測驗中答錯了以下題目，請根據這些錯誤的概念，以繁體中文為他撰寫一段專屬的「AI 弱點分析與學習建議」(約 150-200 字)。語氣要溫暖、具鼓勵性，並具體指出他未來複習的重點方向：\n\n${wrongQuestions.join('\n\n')}`;
+      }
+
+      try {
+        const response = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-09-2025:generateContent?key=${apiKey}`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] })
+        });
+        if (!response.ok) throw new Error('API 呼叫失敗');
+        const data = await response.json();
+        const textResult = data.candidates?.[0]?.content?.parts?.[0]?.text;
+        state.studyAdvice = textResult || '無法產生學習建議。';
+      } catch (err) {
+        console.error(err);
+        alert('產生學習建議失敗，請稍後再試。');
+      } finally {
+        state.isGeneratingAdvice = false;
+        render();
+      }
+    };
+
+    window.copyGasCodeToClipboard = () => {
+      const code = getGasScriptCode();
+      try {
+        const textArea = document.createElement("textarea");
+        textArea.value = code;
+        document.body.appendChild(textArea);
+        textArea.select();
+        document.execCommand("copy");
+        textArea.remove();
+        alert('GAS 程式碼已成功複製！\n您可以前往 Google Apps Script 貼上並執行了。');
+      } catch (err) {
+        console.error(err);
+        alert('複製失敗，請手動全選下方文字框並複製。');
+      }
+    };
+
+    // --- GAS Code Generation Logic ---
+    const getGasScriptCode = () => {
+      if (!state.examData) return '';
+      
+      const processQuestions = (questions) => {
+        if (!questions) return [];
+        return questions.map(q => {
+          const ansStr = String(q.answer || "").trim();
+          let cIndex = -1;
+
+          cIndex = q.options.findIndex(opt => String(opt).trim() === ansStr);
+
+          if (cIndex === -1) {
+             const cleanAns = ansStr.replace(/^([A-D][\.\、\)]|\([A-D]\))\s*/i, '').trim();
+             cIndex = q.options.findIndex(opt => {
+                const cleanOpt = String(opt).replace(/^([A-D][\.\、\)]|\([A-D]\))\s*/i, '').trim();
+                return cleanOpt === cleanAns && cleanOpt.length > 0;
+             });
+          }
+
+          if (cIndex === -1) {
+             const normalize = (str) => String(str).replace(/[\s，。、！？（）\(\)A-D\.\、]/gi, '');
+             const normAns = normalize(ansStr);
+             if (normAns.length > 0) {
+                cIndex = q.options.findIndex(opt => normalize(opt) === normAns);
+             }
+          }
+
+          if (cIndex === -1) {
+            let bestIdx = -1;
+            let minDiff = 9999;
+            q.options.forEach((opt, idx) => {
+               const oStr = String(opt).trim();
+               if (oStr.includes(ansStr) || ansStr.includes(oStr)) {
+                  const diff = Math.abs(oStr.length - ansStr.length);
+                  if (diff < minDiff) { minDiff = diff; bestIdx = idx; }
+               }
+            });
+            if (bestIdx !== -1) cIndex = bestIdx;
+          }
+
+          const { answer, ...restOfQ } = q;
+          return { ...restOfQ, correctIndex: cIndex !== -1 ? cIndex : 0 };
+        });
+      };
+
+      const processedExamData = {
+        trueFalse: processQuestions(state.examData.trueFalse),
+        multipleChoice: processQuestions(state.examData.multipleChoice)
+      };
+      
+      const safeDataString = JSON.stringify(processedExamData, null, 2);
+      
+      const tfTotalQuestions = processedExamData.trueFalse ? processedExamData.trueFalse.length : 0;
+      const mcTotalQuestions = processedExamData.multipleChoice ? processedExamData.multipleChoice.length : 0;
+      
+      const tfMaxPoints = Math.round(state.config.totalScore * (state.config.tfWeight / 100));
+      const mcMaxPoints = Math.round(state.config.totalScore * (state.config.mcWeight / 100));
+
+      const tfPointsArr = [];
+      if (tfTotalQuestions > 0) {
+        const base = Math.floor(tfMaxPoints / tfTotalQuestions);
+        let remainder = tfMaxPoints % tfTotalQuestions;
+        for (let i = 0; i < tfTotalQuestions; i++) {
+          tfPointsArr.push(base + (remainder > 0 ? 1 : 0));
+          remainder--;
+        }
+      }
+
+      const mcPointsArr = [];
+      if (mcTotalQuestions > 0) {
+        const base = Math.floor(mcMaxPoints / mcTotalQuestions);
+        let remainder = mcMaxPoints % mcTotalQuestions;
+        for (let i = 0; i < mcTotalQuestions; i++) {
+          mcPointsArr.push(base + (remainder > 0 ? 1 : 0));
+          remainder--;
+        }
+      }
+      
+      return `function createQuizForm() {
+  // 設定表單標題
+  var formTitle = "${state.formTitle} 測驗";
+  var form = FormApp.create(formTitle);
+  
+  // 設定為「測驗」模式
+  form.setIsQuiz(true);
+  
+  // 將題庫資料直接嵌入陣列
+  var examData = ${safeDataString};
+
+  // 1. 處理是非題
+  if (examData.trueFalse && examData.trueFalse.length > 0) {
+    var tfPoints = ${JSON.stringify(tfPointsArr)};
+    examData.trueFalse.forEach(function(q, index) {
+      var item = form.addMultipleChoiceItem();
+      item.setTitle(q.question);
+      item.setRequired(true);
+      item.setPoints(tfPoints[index]); 
+      
+      var choices = [];
+      for (var i = 0; i < q.options.length; i++) {
+        var optText = String(q.options[i]).trim();
+        if (i === Number(q.correctIndex)) {
+          choices.push(item.createChoice(optText, true));
+        } else {
+          choices.push(item.createChoice(optText));
+        }
+      }
+      item.setChoices(choices);
+      
+      var feedback = FormApp.createFeedback().setText("解析：\\n" + (q.explanation || "無")).build();
+      item.setFeedbackForCorrect(feedback);
+      item.setFeedbackForIncorrect(feedback);
+    });
+  }
+
+  // 2. 處理選擇題
+  if (examData.multipleChoice && examData.multipleChoice.length > 0) {
+    var mcPoints = ${JSON.stringify(mcPointsArr)};
+    examData.multipleChoice.forEach(function(q, index) {
+      var item = form.addMultipleChoiceItem();
+      item.setTitle(q.question);
+      item.setRequired(true);
+      item.setPoints(mcPoints[index]); 
+      
+      var choices = [];
+      for (var i = 0; i < q.options.length; i++) {
+        var optText = String(q.options[i]).trim();
+        if (i === Number(q.correctIndex)) {
+          choices.push(item.createChoice(optText, true));
+        } else {
+          choices.push(item.createChoice(optText));
+        }
+      }
+      item.setChoices(choices);
+      
+      var feedback = FormApp.createFeedback().setText("解析：\\n" + (q.explanation || "無")).build();
+      item.setFeedbackForCorrect(feedback);
+      item.setFeedbackForIncorrect(feedback);
+    });
+  }
+
+  Logger.log("測驗表單建立成功！");
+  Logger.log("請點擊此連結編輯表單：" + form.getEditUrl());
+}`;
+    };
+
+    // --- Render Functions ---
+    const renderQuestion = (q, index, typeLabel) => {
+      const userAnswer = state.userAnswers[q.id];
+      const isAnswered = !!userAnswer;
+
+      let optionsHtml = q.options.map((opt, i) => {
+        let btnClass = "w-full text-left p-4 rounded-lg border-2 transition-all duration-200 ";
+        let iconHtml = '';
+
+        if (!isAnswered) {
+          btnClass += "border-slate-200 hover:border-blue-400 hover:bg-blue-50 text-slate-700 cursor-pointer";
+        } else {
+          if (opt === q.answer) {
+            btnClass += "border-green-500 bg-green-50 text-green-800 font-medium";
+            iconHtml = `<i data-lucide="check-circle" class="w-5 h-5 text-green-500 inline mr-2"></i>`;
+          } else if (userAnswer.selectedOption === opt && !userAnswer.isCorrect) {
+            btnClass += "border-red-400 bg-red-50 text-red-700 opacity-80";
+            iconHtml = `<i data-lucide="x-circle" class="w-5 h-5 text-red-500 inline mr-2"></i>`;
+          } else {
+            btnClass += "border-slate-100 bg-slate-50 text-slate-400 cursor-not-allowed opacity-50";
+          }
+        }
+
+        return `
+          <button
+            ${isAnswered ? 'disabled' : ''}
+            onclick="handleAnswerSelect('${q.id}', '${i}')"
+            class="${btnClass}"
+          >
+            <div class="flex items-center">
+              ${iconHtml}
+              <span>${escapeHTML(opt)}</span>
+            </div>
+          </button>
+        `;
+      }).join('');
+
+      let feedbackHtml = '';
+      if (isAnswered) {
+        feedbackHtml = `
+          <div class="mt-6 pl-12 pr-4 py-4 rounded-lg border-l-4 ${userAnswer.isCorrect ? 'bg-green-50 border-green-500' : 'bg-red-50 border-red-500'}">
+            <p class="font-bold mb-1 flex items-center gap-2">
+               ${userAnswer.isCorrect 
+                 ? `<span class="text-green-700"><i data-lucide="check-circle" class="w-5 h-5 inline mr-1"></i> 答對了！</span>`
+                 : `<span class="text-red-700"><i data-lucide="x-circle" class="w-5 h-5 inline mr-1"></i> 答錯了！</span>`
+               }
+            </p>
+            <div class="text-slate-700">
+              <span class="font-semibold">正解為：</span> ${escapeHTML(q.answer)}
+              <hr class="my-2 border-slate-200/50" />
+              <span class="font-semibold text-slate-600">詳細解析：</span>
+              <p class="mt-1 text-slate-600 leading-relaxed">${escapeHTML(q.explanation)}</p>
+            </div>
+          </div>
+        `;
+      }
+
+      return `
+        <div class="mb-6 p-6 bg-white rounded-xl shadow-sm border border-slate-200 transition-all hover:shadow-md">
+          <div class="flex items-start gap-3 mb-4">
+            <span class="flex-shrink-0 bg-blue-100 text-blue-700 font-bold px-3 py-1 rounded-full text-sm">
+              ${typeLabel} ${index + 1}
+            </span>
+            <h3 class="text-lg font-medium text-slate-800 leading-relaxed">${escapeHTML(q.question)}</h3>
+          </div>
+          <div class="space-y-3 pl-12">
+            ${optionsHtml}
+          </div>
+          ${feedbackHtml}
+        </div>
+      `;
+    };
+
+    const render = () => {
+      const app = document.getElementById('app');
+      let html = '';
+
+      if (state.gameState === 'setup' || state.gameState === 'generating') {
+        html = `
+          <div class="min-h-screen p-4 md:p-8">
+            <div class="max-w-4xl mx-auto space-y-6">
+              
+              <div class="text-center mb-10 pt-8">
+                <h1 class="text-4xl font-extrabold text-slate-800 mb-4 flex items-center justify-center gap-3">
+                  <i data-lucide="book-open" class="w-10 h-10 text-blue-600"></i>
+                  考試資料產生器 <span class="text-blue-600">V3.0</span>
+                </h1>
+                <p class="text-slate-500">上傳您的教材，AI 將為您客製化專屬測驗卷</p>
+              </div>
+
+              <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
+                <!-- Left Col -->
+                <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 flex flex-col">
+                  <h2 class="text-xl font-bold text-slate-800 mb-4 flex items-center gap-2">
+                    <i data-lucide="upload" class="w-5 h-5 text-blue-500"></i> 資料來源
+                  </h2>
+                  <div class="mb-4">
+                    <label class="block text-sm font-medium text-slate-700 mb-2">上傳檔案 (支援 .txt, .md, .docx, NotebookLM 等匯出檔)</label>
+                    <input type="file" onchange="handleFileUpload(event)" class="block w-full text-sm text-slate-500 file:mr-4 file:py-2 file:px-4 file:rounded-full file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100 transition-colors" />
+                  </div>
+                  <div class="flex-1 flex flex-col">
+                    <label class="block text-sm font-medium text-slate-700 mb-2">或直接貼上文字內容 (支援 Word/PDF 內容複製)</label>
+                    <textarea 
+                      class="w-full flex-1 p-4 border border-slate-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-blue-500 transition-shadow resize-none min-h-[250px]"
+                      placeholder="請在此貼上您的教材、文章或重點筆記..."
+                      oninput="handleDocumentTextChange(this.value)"
+                    >${escapeHTML(state.documentText)}</textarea>
+                    
+                    <div class="mt-3">
+                      <button onclick="generateSummary()" ${state.isSummarizing || !state.documentText.trim() ? 'disabled' : ''} class="flex items-center gap-2 text-sm px-4 py-2 bg-indigo-50 text-indigo-700 font-bold rounded-lg hover:bg-indigo-100 transition-colors disabled:opacity-50">
+                        ${state.isSummarizing ? `<i data-lucide="refresh-cw" class="w-4 h-4 animate-spin"></i>` : `<i data-lucide="sparkles" class="w-4 h-4"></i>`}
+                        ✨ AI 智能重點摘要
+                      </button>
+                      ${state.summary ? `
+                      <div class="mt-3 p-4 bg-indigo-50/50 border border-indigo-100 rounded-lg text-sm text-slate-700 whitespace-pre-wrap">
+                        <div class="font-bold text-indigo-800 mb-2 flex items-center gap-2">
+                          <i data-lucide="lightbulb" class="w-4 h-4"></i> 文本核心重點：
+                        </div>
+                        ${escapeHTML(state.summary)}
+                      </div>` : ''}
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Right Col -->
+                <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-200">
+                  <h2 class="text-xl font-bold text-slate-800 mb-6 flex items-center gap-2">
+                    <i data-lucide="settings" class="w-5 h-5 text-blue-500"></i> 考卷基本資料設定
+                  </h2>
+                  <div class="space-y-5">
+                    <div>
+                       <label class="block text-sm font-bold text-slate-700 mb-2">考卷難易度</label>
+                       <select onchange="handleConfigChange('difficulty', this.value)" class="w-full p-3 border border-slate-300 rounded-lg bg-slate-50 focus:ring-2 focus:ring-blue-500">
+                          <option value="容易" ${state.config.difficulty === '容易' ? 'selected' : ''}>容易 (理解與記憶為主)</option>
+                          <option value="中等" ${state.config.difficulty === '中等' ? 'selected' : ''}>中等 (概念辨析、情境化理解)</option>
+                          <option value="困難" ${state.config.difficulty === '困難' ? 'selected' : ''}>困難 (跨段整合、推理、常見迷思)</option>
+                       </select>
+                    </div>
+                    <div class="grid grid-cols-2 gap-4 bg-slate-50 p-4 rounded-lg">
+                      <div>
+                        <label class="block text-sm font-bold text-slate-700 mb-2">是非題數量 (0-10)</label>
+                        <input type="number" min="0" max="10" value="${state.config.tfCount}" onchange="handleConfigChange('tfCount', this.value)" class="w-full p-2 border border-slate-300 rounded-lg text-center"/>
+                      </div>
+                      <div>
+                        <label class="block text-sm font-bold text-slate-700 mb-2">選擇題數量 (0-10)</label>
+                        <input type="number" min="0" max="10" value="${state.config.mcCount}" onchange="handleConfigChange('mcCount', this.value)" class="w-full p-2 border border-slate-300 rounded-lg text-center"/>
+                      </div>
+                    </div>
+                    <div class="bg-blue-50/50 p-4 rounded-lg border border-blue-100">
+                      <div class="mb-4">
+                        <label class="block text-sm font-bold text-slate-700 mb-2">整份考卷總分</label>
+                        <input type="number" min="10" value="${state.config.totalScore}" onchange="handleConfigChange('totalScore', this.value)" class="w-full p-2 border border-blue-200 rounded-lg text-center font-bold text-blue-700"/>
+                      </div>
+                      <div class="grid grid-cols-2 gap-4">
+                        <div>
+                          <label class="block text-sm font-medium text-slate-600 mb-1">是非題配分比率</label>
+                          <div class="flex items-center gap-2">
+                            <input type="number" min="0" max="100" value="${state.config.tfWeight}" onchange="handleConfigChange('tfWeight', this.value)" class="w-full p-2 border border-blue-200 rounded-lg text-center"/>
+                            <span class="text-slate-500 font-bold">%</span>
+                          </div>
+                        </div>
+                        <div>
+                          <label class="block text-sm font-medium text-slate-600 mb-1">選擇題配分比率</label>
+                           <div class="flex items-center gap-2">
+                            <input type="number" min="0" max="100" value="${state.config.mcWeight}" onchange="handleConfigChange('mcWeight', this.value)" class="w-full p-2 border border-blue-200 rounded-lg text-center"/>
+                            <span class="text-slate-500 font-bold">%</span>
+                          </div>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              ${state.error ? `
+              <div class="bg-red-50 text-red-600 p-4 rounded-lg flex items-center gap-3 border border-red-200">
+                 <i data-lucide="alert-triangle" class="w-5 h-5 shrink-0"></i>
+                 <p>${escapeHTML(state.error)}</p>
+              </div>` : ''}
+
+              <button onclick="generateExam()" ${state.gameState === 'generating' ? 'disabled' : ''} class="w-full py-5 rounded-2xl text-xl font-bold text-white shadow-lg transition-all flex justify-center items-center gap-3 ${state.gameState === 'generating' ? 'bg-blue-400 cursor-not-allowed' : 'bg-blue-600 hover:bg-blue-700 hover:-translate-y-1 hover:shadow-xl'}">
+                ${state.gameState === 'generating' 
+                  ? `<i data-lucide="refresh-cw" class="w-6 h-6 animate-spin"></i> AI 正在努力閱讀文本並出題中，請稍候...` 
+                  : `開始產生測驗題目 <i data-lucide="arrow-right" class="w-6 h-6"></i>`}
+              </button>
+            </div>
+          </div>
+        `;
+      } 
+      else if (state.gameState === 'playing' && state.examData) {
+        const answeredCount = Object.keys(state.userAnswers).length;
+        const totalCount = state.examData.trueFalse.length + state.examData.multipleChoice.length;
+        const progress = Math.round((answeredCount / totalCount) * 100);
+
+        let tfHtml = '', mcHtml = '';
+        if(state.examData.trueFalse.length > 0) {
+          tfHtml = `<div class="mb-8"><h2 class="text-xl font-bold text-slate-700 mb-4 border-b-2 border-slate-200 pb-2">一、是非題</h2>` + 
+                   state.examData.trueFalse.map((q, i) => renderQuestion(q, i, '是非')).join('') + `</div>`;
+        }
+        if(state.examData.multipleChoice.length > 0) {
+          mcHtml = `<div class="mb-8"><h2 class="text-xl font-bold text-slate-700 mb-4 border-b-2 border-slate-200 pb-2">二、選擇題</h2>` + 
+                   state.examData.multipleChoice.map((q, i) => renderQuestion(q, i, '選擇')).join('') + `</div>`;
+        }
+
+        html = `
+          <div class="min-h-screen pb-32 p-4 md:p-8">
+            <div class="max-w-3xl mx-auto relative">
+              <div class="bg-white p-6 rounded-2xl shadow-sm border border-slate-200 mb-8 sticky top-4 z-10">
+                <div class="flex justify-between items-center mb-4">
+                  <h2 class="text-2xl font-bold text-slate-800 flex items-center gap-2">
+                    <i data-lucide="file-text" class="w-6 h-6 text-blue-600"></i> 隨堂測驗開始
+                  </h2>
+                  <span class="text-slate-500 font-medium">進度: ${answeredCount} / ${totalCount} 題</span>
+                </div>
+                <div class="w-full bg-slate-100 rounded-full h-3 mb-4">
+                  <div class="bg-blue-600 h-3 rounded-full transition-all duration-500 ease-out" style="width: ${progress}%"></div>
+                </div>
+                <div class="flex justify-end pt-3 border-t border-slate-100">
+                  <button onclick="toggleGasModal(true)" class="flex items-center gap-2 px-4 py-2 bg-indigo-50 text-indigo-700 text-sm font-bold rounded-lg hover:bg-indigo-100 transition-colors">
+                    <i data-lucide="code" class="w-4 h-4"></i> 匯出至 Google 表單 (GAS 程式碼)
+                  </button>
+                </div>
+              </div>
+
+              ${state.showGasModal ? `
+              <div class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/40 backdrop-blur-sm">
+                <div class="bg-white w-full max-w-2xl rounded-2xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
+                  <div class="flex justify-between items-center p-6 border-b border-slate-100 bg-slate-50">
+                    <h3 class="text-xl font-bold text-slate-800 flex items-center gap-2">
+                      <i data-lucide="code" class="w-5 h-5 text-indigo-600"></i> 產生 Google 表單腳本
+                    </h3>
+                    <button onclick="toggleGasModal(false)" class="text-slate-400 hover:text-slate-600"><i data-lucide="x" class="w-6 h-6"></i></button>
+                  </div>
+                  <div class="p-6 overflow-y-auto flex-1">
+                    <div class="mb-4">
+                      <label class="block text-sm font-bold text-slate-700 mb-2">1. 設定表單標題 [教材主題或章名]</label>
+                      <input type="text" value="${escapeHTML(state.formTitle)}" oninput="handleFormTitleChange(this.value)" placeholder="例如：第一章 細胞的構造" class="w-full p-3 border border-slate-300 rounded-lg focus:ring-2 focus:ring-indigo-500" />
+                    </div>
+                    <div>
+                      <label class="block text-sm font-bold text-slate-700 mb-2 flex items-center justify-between">
+                        <span>2. 複製以下程式碼至 Google Apps Script 執行</span>
+                      </label>
+                      <div class="relative">
+                        <textarea id="gas-textarea" readonly class="w-full h-64 p-4 bg-slate-800 text-slate-300 font-mono text-xs rounded-xl border border-slate-700 focus:outline-none resize-none">${escapeHTML(getGasScriptCode())}</textarea>
+                        <button onclick="copyGasCodeToClipboard()" class="absolute top-4 right-4 p-2 bg-indigo-600 text-white rounded-lg hover:bg-indigo-500 shadow-md flex items-center gap-1 text-sm font-bold transition-colors">
+                          <i data-lucide="copy" class="w-4 h-4"></i> 點擊複製
+                        </button>
+                      </div>
+                    </div>
+                    <div class="mt-6 p-4 bg-blue-50 text-blue-800 rounded-lg text-sm leading-relaxed border border-blue-100">
+                      <strong class="block mb-1">使用說明與注意事項：</strong>
+                      1. 前往 <a href="https://script.google.com/" target="_blank" class="underline font-bold">Google Apps Script</a> 並建立新專案。<br/>
+                      2. 將上方複製的程式碼貼上，取代原本的 <code>myFunction()</code>，並點擊「執行 (Run)」。<br/>
+                      <span class="text-red-600 font-bold block mt-2">
+                        3. 終極除錯：若學生提交後還是看不見解答與詳解，這是 Google 表單常見的 API 快取問題。請進入表單右上角「設定」➔ 將【設為測驗】關閉後再「重新開啟」一次，即可強制刷新設定！
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              </div>` : ''}
+
+              <div class="space-y-8">
+                ${tfHtml}
+                ${mcHtml}
+              </div>
+
+              <div class="mt-12 text-center">
+                <button onclick="handleFinishExam()" class="px-12 py-4 rounded-xl text-xl font-bold text-white shadow-lg transition-all ${window.isExamFinished() ? 'bg-green-600 hover:bg-green-700 hover:scale-105 animate-pulse' : 'bg-slate-400 hover:bg-slate-500'}">
+                  ${window.isExamFinished() ? '全部作答完成，點此評分！' : '結束測驗並評分 (尚有未答題目)'}
+                </button>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+      else if (state.gameState === 'results') {
+        const scores = calculateScores();
+        html = `
+          <div class="min-h-screen bg-slate-100 flex items-center justify-center p-4 md:p-8">
+            <div id="result-screen-content" class="max-w-2xl w-full bg-white rounded-3xl shadow-xl overflow-hidden border border-slate-200">
+              <div class="bg-slate-800 p-8 text-center text-white relative">
+                 <i data-lucide="bar-chart" class="w-12 h-12 mx-auto mb-4 text-blue-400 opacity-80"></i>
+                 <h1 class="text-3xl font-bold mb-2">測驗結果報告</h1>
+                 <p class="text-slate-400">根據您的作答與配分設定計算出的最終成績</p>
+              </div>
+              <div class="p-8 md:p-12">
+                <div class="text-center mb-10">
+                  <h2 class="text-slate-500 font-bold tracking-widest uppercase text-sm mb-2">總得分</h2>
+                  <div class="text-7xl font-black text-red-600 drop-shadow-sm">
+                    ${scores.total} <span class="text-2xl text-slate-400 font-medium">/ ${state.config.totalScore}</span>
+                  </div>
+                </div>
+
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-8 mb-10">
+                  <div class="bg-slate-50 rounded-2xl p-6 border border-slate-100 flex flex-col justify-center">
+                    <h3 class="text-lg font-bold text-slate-700 mb-4 border-b border-slate-200 pb-2">得分分佈</h3>
+                    <div class="space-y-4">
+                      <div class="flex justify-between items-center">
+                        <span class="text-slate-600 font-medium">是非題 (${state.config.tfWeight}%)</span>
+                        <span class="text-xl font-bold text-slate-800">${scores.tfScore} 分</span>
+                      </div>
+                      <div class="text-sm text-slate-400 mt-[-10px] mb-2">答對 ${scores.tfCorrect} / ${scores.tfTotalQuestions} 題</div>
+                      <div class="flex justify-between items-center">
+                        <span class="text-slate-600 font-medium">選擇題 (${state.config.mcWeight}%)</span>
+                        <span class="text-xl font-bold text-slate-800">${scores.mcScore} 分</span>
+                      </div>
+                      <div class="text-sm text-slate-400 mt-[-10px]">答對 ${scores.mcCorrect} / ${scores.mcTotalQuestions} 題</div>
+                    </div>
+                  </div>
+
+                  <div class="bg-slate-50 rounded-2xl p-6 border border-slate-100 flex flex-col items-center justify-center">
+                     <h3 class="text-lg font-bold text-slate-700 mb-4 border-b border-slate-200 pb-2 w-full text-center">整體正確率</h3>
+                     <div class="relative w-32 h-32 flex items-center justify-center">
+                        <svg viewBox="0 0 100 100" class="absolute inset-0 w-full h-full rounded-full">
+                          <circle cx="50" cy="50" r="50" fill="#ef4444" />
+                          <circle cx="50" cy="50" r="25" fill="transparent" stroke="#22c55e" stroke-width="50" stroke-dasharray="${(scores.accuracy / 100) * 157.08} 157.08" transform="rotate(-90 50 50)" />
+                          <circle cx="50" cy="50" r="38" fill="#f8fafc" />
+                        </svg>
+                        <span class="relative z-10 text-2xl font-black text-slate-800">${scores.accuracy}%</span>
+                     </div>
+                     <div class="flex gap-4 mt-4 text-sm font-medium">
+                       <div class="flex items-center gap-1"><span class="w-3 h-3 rounded-full bg-green-500"></span> 答對</div>
+                       <div class="flex items-center gap-1"><span class="w-3 h-3 rounded-full bg-red-500"></span> 答錯</div>
+                     </div>
+                  </div>
+                </div>
+
+                <div class="mb-10 px-4 md:px-0">
+                   ${!state.studyAdvice && !state.isGeneratingAdvice ? `
+                     <button onclick="generateStudyAdvice()" class="w-full py-4 bg-gradient-to-r from-purple-500 to-indigo-600 text-white font-bold rounded-2xl shadow-md hover:shadow-lg hover:-translate-y-1 transition-all flex items-center justify-center gap-2">
+                       <i data-lucide="sparkles" class="w-6 h-6"></i> ✨ 獲取 AI 專屬弱點分析與學習建議
+                     </button>
+                   ` : state.isGeneratingAdvice ? `
+                     <div class="w-full py-4 bg-purple-100 text-purple-700 font-bold rounded-2xl flex items-center justify-center gap-2">
+                       <i data-lucide="refresh-cw" class="w-6 h-6 animate-spin"></i> AI 正在分析您的作答記錄...
+                     </div>
+                   ` : `
+                     <div class="bg-gradient-to-br from-indigo-50 to-purple-50 p-6 rounded-2xl border border-purple-100 shadow-sm relative">
+                       <i data-lucide="sparkles" class="absolute top-4 right-4 w-6 h-6 text-purple-300"></i>
+                       <h3 class="text-lg font-bold text-purple-800 mb-3 flex items-center gap-2">
+                         <i data-lucide="lightbulb" class="w-5 h-5 text-yellow-500"></i> AI 專屬學習建議
+                       </h3>
+                       <div class="text-slate-700 leading-relaxed whitespace-pre-wrap">${escapeHTML(state.studyAdvice)}</div>
+                     </div>
+                   `}
+                </div>
+
+                <div id="result-action-buttons" class="flex flex-col sm:flex-row gap-4 justify-center mt-4">
+                  <button onclick="downloadScoreScreen()" ${state.isDownloadingScore ? 'disabled' : ''} class="flex items-center justify-center gap-2 px-6 py-3 bg-blue-100 text-blue-700 font-bold rounded-xl hover:bg-blue-200 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                    ${state.isDownloadingScore ? `<i data-lucide="refresh-cw" class="w-5 h-5 animate-spin"></i> 畫面快速擷取中...` : `<i data-lucide="download" class="w-5 h-5"></i> 下載成績畫面`}
+                  </button>
+                  <button onclick="resetApp()" ${state.isDownloadingScore ? 'disabled' : ''} class="flex items-center justify-center gap-2 px-6 py-3 bg-slate-800 text-white font-bold rounded-xl hover:bg-slate-900 transition-colors disabled:opacity-50 disabled:cursor-not-allowed">
+                    <i data-lucide="refresh-cw" class="w-5 h-5"></i> 重新建立一份考卷
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      app.innerHTML = html;
+      lucide.createIcons(); // Initialize icons after rendering HTML
+    };
+
+    // Initial render
+    render();
+
+  </script>
+</body>
+</html>
