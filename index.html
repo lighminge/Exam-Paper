@@ -854,13 +854,19 @@ ${state.documentText}`;
                 <div class="grid grid-cols-1 md:grid-cols-2 gap-6 mb-10">
                   <div class="bg-slate-50 rounded-2xl p-6 border border-slate-100">
                     <h3 class="text-lg font-bold text-slate-700 mb-4 border-b border-slate-200 pb-2">得分分佈</h3>
-                    <div class="flex justify-between items-center mb-2">
-                      <span class="text-slate-600">是非題 (${state.config.tfWeight}%)</span>
-                      <span class="font-bold">${scores.tfScore} 分</span>
+                    <div class="mb-4">
+                      <div class="flex justify-between items-center">
+                        <span class="text-slate-600 font-medium">是非題 (${state.config.tfWeight}%)</span>
+                        <span class="text-lg font-bold text-slate-800">${scores.tfScore} 分</span>
+                      </div>
+                      <div class="text-sm text-slate-400 mt-1">答對 ${scores.tfCorrect} / ${scores.tfTotalQuestions} 題</div>
                     </div>
-                    <div class="flex justify-between items-center">
-                      <span class="text-slate-600">選擇題 (${state.config.mcWeight}%)</span>
-                      <span class="font-bold">${scores.mcScore} 分</span>
+                    <div>
+                      <div class="flex justify-between items-center">
+                        <span class="text-slate-600 font-medium">選擇題 (${state.config.mcWeight}%)</span>
+                        <span class="text-lg font-bold text-slate-800">${scores.mcScore} 分</span>
+                      </div>
+                      <div class="text-sm text-slate-400 mt-1">答對 ${scores.mcCorrect} / ${scores.mcTotalQuestions} 題</div>
                     </div>
                   </div>
                   <div class="bg-slate-50 rounded-2xl p-6 border border-slate-100 flex flex-col items-center justify-center">
