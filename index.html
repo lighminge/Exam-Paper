@@ -470,29 +470,16 @@ ${state.documentText}`;
     window.getGasScriptCode = () => {
       if (!state.examData) return '';
       
-      // Data Processing for GAS
-      const processQuestions = (questions) => {
-        if (!questions) return [];
-        return questions.map(q => {
-          const ansStr = String(q.answer || "").trim();
-          let cIndex = q.options.findIndex(opt => String(opt).trim() === ansStr);
-          if (cIndex === -1) cIndex = 0; // fallback
-          const { answer, ...restOfQ } = q;
-          return { ...restOfQ, correctIndex: cIndex };
-        });
-      };
-
-      const processedData = {
-        trueFalse: processQuestions(state.examData.trueFalse),
-        multipleChoice: processQuestions(state.examData.multipleChoice)
-      };
-
       // 計算各題配分 (處理無法整除時的餘數)
-      const tfTotal = processedData.trueFalse.length;
-      const mcTotal = processedData.multipleChoice.length;
+      const tfTotal = state.examData.trueFalse ? state.examData.trueFalse.length : 0;
+      const mcTotal = state.examData.multipleChoice ? state.examData.multipleChoice.length : 0;
       
-      const tfMaxPoints = Math.round(state.config.totalScore * (state.config.tfWeight / 100));
-      const mcMaxPoints = Math.round(state.config.totalScore * (state.config.mcWeight / 100));
+      const totalScoreNum = Number(state.config.totalScore) || 100;
+      const tfWeightNum = Number(state.config.tfWeight) || 50;
+      const mcWeightNum = Number(state.config.mcWeight) || 50;
+
+      const tfMaxPoints = Math.round(totalScoreNum * (tfWeightNum / 100));
+      const mcMaxPoints = Math.round(totalScoreNum * (mcWeightNum / 100));
 
       const tfPointsArr = [];
       if (tfTotal > 0) {
@@ -514,25 +501,49 @@ ${state.documentText}`;
         }
       }
       
+      // Data Processing for GAS：直接把分數綁定進物件裡
+      const processQuestions = (questions, pointsArr) => {
+        if (!questions) return [];
+        return questions.map((q, index) => {
+          const ansStr = String(q.answer || "").trim();
+          let cIndex = q.options.findIndex(opt => String(opt).trim() === ansStr);
+          if (cIndex === -1) cIndex = 0; // fallback
+          const { answer, ...restOfQ } = q;
+          return { 
+            ...restOfQ, 
+            correctIndex: cIndex,
+            points: pointsArr[index] || 0 // 🌟 將分數直接寫入該題資料
+          };
+        });
+      };
+
+      const processedData = {
+        trueFalse: processQuestions(state.examData.trueFalse, tfPointsArr),
+        multipleChoice: processQuestions(state.examData.multipleChoice, mcPointsArr)
+      };
+
       return `function createQuizForm() {
   var formTitle = "${state.formTitle} 測驗";
   var form = FormApp.create(formTitle);
   form.setIsQuiz(true);
   
+  // 包含「題目配分 (points)」的完整考卷資料
   var examData = ${JSON.stringify(processedData, null, 2)};
-  var tfPoints = ${JSON.stringify(tfPointsArr)};
-  var mcPoints = ${JSON.stringify(mcPointsArr)};
 
   // 1. 處理是非題
   if (examData.trueFalse && examData.trueFalse.length > 0) {
-    examData.trueFalse.forEach(function(q, index) {
+    examData.trueFalse.forEach(function(q) {
       var item = form.addMultipleChoiceItem();
-      item.setTitle(q.question).setRequired(true).setPoints(tfPoints[index]);
+      item.setTitle(q.question);
+      item.setRequired(true);
+      if (q.points > 0) item.setPoints(q.points); // 🌟 設定該題分數
+      
       var choices = [];
       for (var i = 0; i < q.options.length; i++) {
         choices.push(item.createChoice(String(q.options[i]).trim(), i === Number(q.correctIndex)));
       }
       item.setChoices(choices);
+      
       var feedback = FormApp.createFeedback().setText("解析：\\n" + (q.explanation || "無")).build();
       item.setFeedbackForCorrect(feedback).setFeedbackForIncorrect(feedback);
     });
@@ -540,14 +551,18 @@ ${state.documentText}`;
 
   // 2. 處理選擇題
   if (examData.multipleChoice && examData.multipleChoice.length > 0) {
-    examData.multipleChoice.forEach(function(q, index) {
+    examData.multipleChoice.forEach(function(q) {
       var item = form.addMultipleChoiceItem();
-      item.setTitle(q.question).setRequired(true).setPoints(mcPoints[index]);
+      item.setTitle(q.question);
+      item.setRequired(true);
+      if (q.points > 0) item.setPoints(q.points); // 🌟 設定該題分數
+      
       var choices = [];
       for (var i = 0; i < q.options.length; i++) {
         choices.push(item.createChoice(String(q.options[i]).trim(), i === Number(q.correctIndex)));
       }
       item.setChoices(choices);
+      
       var feedback = FormApp.createFeedback().setText("解析：\\n" + (q.explanation || "無")).build();
       item.setFeedbackForCorrect(feedback).setFeedbackForIncorrect(feedback);
     });
