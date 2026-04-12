@@ -486,6 +486,33 @@ ${state.documentText}`;
         trueFalse: processQuestions(state.examData.trueFalse),
         multipleChoice: processQuestions(state.examData.multipleChoice)
       };
+
+      // 計算各題配分 (處理無法整除時的餘數)
+      const tfTotal = processedData.trueFalse.length;
+      const mcTotal = processedData.multipleChoice.length;
+      
+      const tfMaxPoints = Math.round(state.config.totalScore * (state.config.tfWeight / 100));
+      const mcMaxPoints = Math.round(state.config.totalScore * (state.config.mcWeight / 100));
+
+      const tfPointsArr = [];
+      if (tfTotal > 0) {
+        const base = Math.floor(tfMaxPoints / tfTotal);
+        let remainder = tfMaxPoints % tfTotal;
+        for (let i = 0; i < tfTotal; i++) {
+          tfPointsArr.push(base + (remainder > 0 ? 1 : 0));
+          remainder--;
+        }
+      }
+
+      const mcPointsArr = [];
+      if (mcTotal > 0) {
+        const base = Math.floor(mcMaxPoints / mcTotal);
+        let remainder = mcMaxPoints % mcTotal;
+        for (let i = 0; i < mcTotal; i++) {
+          mcPointsArr.push(base + (remainder > 0 ? 1 : 0));
+          remainder--;
+        }
+      }
       
       return `function createQuizForm() {
   var formTitle = "${state.formTitle} 測驗";
@@ -493,12 +520,14 @@ ${state.documentText}`;
   form.setIsQuiz(true);
   
   var examData = ${JSON.stringify(processedData, null, 2)};
+  var tfPoints = ${JSON.stringify(tfPointsArr)};
+  var mcPoints = ${JSON.stringify(mcPointsArr)};
 
   // 1. 處理是非題
   if (examData.trueFalse && examData.trueFalse.length > 0) {
-    examData.trueFalse.forEach(function(q) {
+    examData.trueFalse.forEach(function(q, index) {
       var item = form.addMultipleChoiceItem();
-      item.setTitle(q.question).setRequired(true);
+      item.setTitle(q.question).setRequired(true).setPoints(tfPoints[index]);
       var choices = [];
       for (var i = 0; i < q.options.length; i++) {
         choices.push(item.createChoice(String(q.options[i]).trim(), i === Number(q.correctIndex)));
@@ -511,9 +540,9 @@ ${state.documentText}`;
 
   // 2. 處理選擇題
   if (examData.multipleChoice && examData.multipleChoice.length > 0) {
-    examData.multipleChoice.forEach(function(q) {
+    examData.multipleChoice.forEach(function(q, index) {
       var item = form.addMultipleChoiceItem();
-      item.setTitle(q.question).setRequired(true);
+      item.setTitle(q.question).setRequired(true).setPoints(mcPoints[index]);
       var choices = [];
       for (var i = 0; i < q.options.length; i++) {
         choices.push(item.createChoice(String(q.options[i]).trim(), i === Number(q.correctIndex)));
